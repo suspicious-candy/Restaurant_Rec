@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Data files (Yelp dataset is large — keep it out of git)
+*.json
+*.csv
+*.parquet
+data/
+!.gitignore
+
+# OS
+.DS_Store
+Thumbs.db
