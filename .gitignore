@@ -20,6 +20,19 @@ __pycache__/
 data/
 !.gitignore
 
+# The vector index is a DERIVED artifact, not source. rebuild_index.py
+# regenerates it from Mongo in a couple of minutes, and chroma.sqlite3 alone is
+# 470MB — well past GitHub's hard 100MB-per-file limit, so a repo containing it
+# can never be pushed at all.
+chroma_db/
+
+# 71MB of concatenated Yelp reviews, produced by save_clean_data.py.
+tagged_reviews.txt
+
+# Node dependencies (a stray package.json pulled these in).
+node_modules/
+package-lock.json
+
 # OS
 .DS_Store
 Thumbs.db

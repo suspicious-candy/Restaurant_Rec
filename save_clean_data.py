@@ -19,6 +19,18 @@ print("Dataset path:", path)
 
 
 def load(name):
+    """Read one Yelp dataset table into a DataFrame.
+
+    The raw files are newline-delimited JSON of several GB, so they are read in
+    chunks and capped at 500k rows — enough for exploration, small enough to
+    hold in memory.
+
+    Args:
+        name: table name, e.g. "review", "business", "user", "tip".
+
+    Returns:
+        A DataFrame of up to 500,000 rows.
+    """
     return pd.concat(
         pd.read_json(f"{path}/yelp_academic_dataset_{name}.json",
                      lines=True, chunksize=100_000, nrows=500_000)
@@ -76,6 +88,18 @@ reviews["wordsInDesc"] = reviews["text"].str.split().str.len()
 
 
 def fast_lang(text):
+    """Detect a review's language, for filtering the corpus down to English.
+
+    Short strings are skipped rather than guessed at — language detection on
+    under ~20 characters is close to a coin flip. fastText's detector rejects
+    embedded newlines, hence the replace.
+
+    Args:
+        text: review body, possibly missing or too short.
+
+    Returns:
+        An ISO language code such as "en", or None if undetectable.
+    """
     if not isinstance(text, str) or len(text.strip()) < 20:
         return None
     return ft_detect(text.replace("\n", " "))["lang"]
