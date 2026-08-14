@@ -18,9 +18,9 @@ Foursquare API ──► MongoDB `restaurants`  ◄── source of truth for te
                           │  rebuild_index.py   (the index's ONLY writer)
                           ▼
                    Chroma `places_v2`     ◄── derived index, disposable
-                          │
-                          │  service.py     (read-only)
-                          ▼
+                          ▲  │
+        POST /index/missing │  │  service.py
+     (same build_text path) │  ▼
               POST /recommend  ·  POST /recommend/group
                           ▲
                           │  HTTP
@@ -31,6 +31,13 @@ Foursquare API ──► MongoDB `restaurants`  ◄── source of truth for te
 what makes the embedding model, the chunking, and the text template all
 changeable later — none of which is possible if accumulated text lives only
 inside the vector store. The index can be deleted and rebuilt at any time.
+
+The invariant is **one text template**, not "the service never writes".
+`/index/missing` does write, but it reads the text from Mongo and runs the same
+`build_text -> chunk -> pool` pipeline `rebuild_index.py` runs — it is imported,
+not reimplemented. Callers choose WHICH rows get indexed, never WHAT is
+embedded. That distinction is the whole reason the old `/embed` endpoint had to
+go: it let callers push their own sentence.
 
 ---
 
@@ -70,6 +77,21 @@ logs `ECONNREFUSED` and silently degrades to an unranked list.
 { "query": "A Italian, Pizza restaurant", "k": 5, "candidateIds": ["4f24…"] }
 → { "businessIds": ["4f24…", …] }
 ```
+
+### `POST /index/missing`
+
+```jsonc
+{ "businessIds": ["4f24…", …] }
+→ { "requested": 50, "alreadyIndexed": 38, "written": 12,
+    "skipped": 0, "truncated": false }
+```
+
+Embeds any of the given restaurants that Mongo has and Chroma lacks. Palate
+calls this fire-and-forget from `/api/Restaurants/nearby` after syncing a cold
+area, so those places have vectors by the next request — and, more to the point,
+by the time a group needs a shortlist there. Capped at `MAX_INDEX_BATCH` (500)
+per call, because encoding happens inside the request; a full build is still
+`rebuild_index.py`'s job.
 
 ### `POST /recommend/group`
 
@@ -111,8 +133,8 @@ thresholding.
 
 | file | purpose |
 |---|---|
-| `service.py` | FastAPI read API. Never writes the index. |
-| `rebuild_index.py` | Builds `places_v2` from Mongo. The only writer. |
+| `service.py` | FastAPI API. Reads for `/recommend*`; tops up vectors via `/index/missing`. |
+| `rebuild_index.py` | Builds `places_v2` from Mongo. Owns `build_text` — the one template. |
 | `backfill_source.py` | One-time: stamps every restaurant with its provenance. |
 | `experiment_template.py` | Offline comparison of embedding text templates. |
 | `export_seed.py` | One-time: Yelp parquet → `palate/scripts/data/restaurants.seed.json`. |
@@ -248,12 +270,18 @@ sentence pairs land (the square root is very flat there), and it is comparable
 across group sizes — `consensus` for unrelated members floors near `1/√N`, so
 the same value means "divided" for a pair and "aligned" for six.
 
-### One writer, one template
+### One template, not one writer
 
 A `/embed` endpoint used to let callers push their own text. That made two
-writers with two templates — the caller's kept the restaurant name — and wrote
-vectors Mongo could not reproduce, so any `--recreate` silently changed them.
-Removed. Sync writes Mongo; `rebuild_index.py --only-missing` builds vectors.
+templates — the caller's kept the restaurant name, embedding at 74% category
+precision against this index's 95% — and wrote vectors Mongo could not
+reproduce, so any `--recreate` silently changed them. Removed.
+
+The rule it was replaced with is narrower than "only one process writes":
+`/index/missing` writes too. What it does not do is accept text. It takes
+`businessIds`, reads those rows from Mongo, and calls the same `build_text`
+`rebuild_index.py` calls — by importing it, so the two cannot drift. **Callers
+choose which rows to index, never what to embed.**
 
 ---
 
@@ -269,7 +297,11 @@ Removed. Sync writes Mongo; `rebuild_index.py --only-missing` builds vectors.
   exactly 50 restaurants. 51% of the corpus sits in localities with fewer than
   50 places; a random anchor sees a median of 50 candidates within 30 km.
 - **No per-person taste vectors yet.** `/recommend/group` accepts them via
-  `vectors`; nothing builds them.
+  `vectors`; nothing builds them. Palate sends one short sentence per member,
+  assembled by `lib/tasteQuery.ts` from their liked cuisines and diet.
+- **No exclusion filter.** Palate used to intersect a `disliked` cuisine list
+  out of the candidates before ranking; that field is no longer tracked, so
+  group shortlists are now shaped by attraction alone.
 - **No evaluation harness.** Every number above came from a throwaway script.
   Promoting them into a repeatable suite with a fixed probe set is what would
   make "did that change help?" answerable.

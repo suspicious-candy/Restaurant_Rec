@@ -1,13 +1,18 @@
-"""FastAPI read-side of the Palate recommender.
+"""FastAPI service for the Palate recommender.
 
-This service only ever READS the vector index. Writing is owned entirely by
-rebuild_index.py, which builds from MongoDB — one writer, one source of truth,
-one text template. (An older /embed endpoint let callers push their own text
-and was removed; see the note above RecReq.)
+Text comes from MongoDB and is turned into vectors by exactly one function,
+rebuild_index.build_text. That is the invariant — not "the service never
+writes". An older /embed endpoint let CALLERS push their own sentence, which
+made a second template that kept the restaurant name and embedded at 74%
+category precision against this one's 95%; it was removed for that reason.
+/index/missing below writes, but it reads the text from Mongo and runs the same
+build_text -> chunk -> pool pipeline rebuild_index.py runs, so there is still
+one template. Callers choose WHICH rows to index, never WHAT to embed.
 
-Two endpoints:
+Three endpoints:
     POST /recommend        one text query  -> ranked businessIds
     POST /recommend/group  N members       -> ranked businessIds for a group
+    POST /index/missing    top up vectors for rows Mongo has and Chroma lacks
 
 Both take an optional `candidateIds`, and passing it is strongly preferred:
 retrieval should be a FILTER (the caller decides what is reachable — nearby,
@@ -31,11 +36,21 @@ to a service that is already running.
 import pyarrow  # noqa: F401
 import pyarrow.dataset  # noqa: F401
 
+import os
+
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from dotenv import load_dotenv
+from pymongo import MongoClient
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+
+# The indexing pipeline, imported rather than reimplemented — this is what keeps
+# "one text template" true now that this process can write. rebuild_index.py
+# guards main() behind __name__, so importing it costs only its module-level
+# constants.
+from rebuild_index import build_text, chunk, pool
 
 app = FastAPI()
 
@@ -63,6 +78,41 @@ MAX_CANDIDATES = 500
 
 # Aggregation functions available to /recommend/group. See _aggregate().
 STRATEGIES = ("blend", "min", "mean", "centroid")
+
+# Ceiling on one /index/missing call. Encoding is the slow part and this runs
+# inside a request, so a caller that has just synced 50 places gets them indexed
+# immediately while an accidental corpus-wide call is truncated rather than
+# holding a worker for minutes. A full build is still rebuild_index.py's job.
+MAX_INDEX_BATCH = 500
+
+_mongo = None
+
+
+def _restaurants():
+    """The Mongo `restaurants` collection, connected on first use.
+
+    Lazy on purpose: the read endpoints do not need Mongo, and connecting at
+    import time would mean an unreachable database stops the recommender from
+    serving searches it is perfectly capable of serving.
+
+    Returns:
+        A pymongo Collection.
+
+    Raises:
+        HTTPException: 503 if mongo_url is not configured.
+    """
+    global _mongo
+    if _mongo is None:
+        # Same path rebuild_index.py uses; the service is run from this
+        # directory. .strip() because the value in .env has a leading space.
+        load_dotenv(os.path.join("..", "palate", ".env"))
+        url = (os.environ.get("mongo_url") or "").strip()
+        if not url:
+            raise HTTPException(503, "mongo_url not configured; cannot index")
+        # The URI carries no database name and pymongo will not guess, so name
+        # it explicitly — "test" is where the app's data actually lives.
+        _mongo = MongoClient(url)[os.environ.get("MONGO_DB", "test")]
+    return _mongo.restaurants
 
 
 def _candidate_filter(ids: list[str] | None) -> dict | None:
@@ -435,3 +485,127 @@ def recommend(req: RecReq):
     k = min(req.k, len(req.candidateIds)) if req.candidateIds else req.k
     hits = db.similarity_search(req.query, k=max(1, k), filter=where)
     return {"businessIds": [_business_id(h) for h in hits]}
+
+
+class IndexMissingReq(BaseModel):
+    """Request body for POST /index/missing.
+
+    Attributes:
+        businessIds: restrict the top-up to these fsqIds — what a caller that
+            has just synced a handful of places should send. Omit to sweep
+            every unindexed `source: "foursquare"` row, up to MAX_INDEX_BATCH.
+    """
+    businessIds: list[str] = []
+
+
+@app.post("/index/missing")
+def index_missing(req: IndexMissingReq):
+    """Embed restaurants that MongoDB has and the index does not.
+
+    The gap this closes: a Foursquare sync writes new rows to Mongo, but until
+    something embeds them they are invisible to every search. They still appear
+    in a caller's candidateIds, so the symptom is a silently short result list —
+    or, if a whole area is new, /recommend/group failing with "none of the
+    candidateIds are in the index".
+
+    Doing it here rather than in rebuild_index.py is what makes it usable from
+    the app: the write lands in THIS process's Chroma handle, so the new vectors
+    are searchable immediately. A separate process would leave them invisible
+    until the service restarted, which is the caching caveat in the module
+    docstring.
+
+    Deliberately unchanged from rebuild_index.py: build_text, the chunk window,
+    pool(), the metadata keys, and normalize_embeddings=True. Anything that
+    diverges here produces vectors that are not comparable with the 15,169
+    already stored, which no test would catch — the search would just quietly
+    get worse.
+
+    Returns (JSON):
+        requested: how many ids were considered.
+        alreadyIndexed: how many already had vectors.
+        written: how many were embedded and stored.
+        skipped: rows whose text chunked to nothing.
+        truncated: True if MAX_INDEX_BATCH capped the work, meaning a further
+            call (or a full rebuild_index.py run) is needed.
+
+    Raises:
+        HTTPException: 503 if Mongo is not configured or unreachable.
+    """
+    col = _restaurants()
+
+    query = {"source": "foursquare"}
+    if req.businessIds:
+        query["fsqId"] = {"$in": req.businessIds}
+
+    projection = {"fsqId": 1, "name": 1, "categories": 1,
+                  "location": 1, "rating": 1, "tips": 1}
+    docs = [d for d in col.find(query, projection) if d.get("fsqId")]
+    requested = len(docs)
+
+    # Nothing matched in Mongo — unknown ids, or all of them yelp_seed. Returned
+    # early because Chroma's get() rejects an empty id list outright rather than
+    # returning nothing, which would surface here as a 500.
+    if not docs:
+        return {"requested": 0, "alreadyIndexed": 0,
+                "written": 0, "skipped": 0, "truncated": False}
+
+    # One get() for the ids we care about, not the whole collection — asking
+    # Chroma for the ~20k it holds to check 50 would dominate the request.
+    ids = [d["fsqId"] for d in docs]
+    known = set(db._collection.get(ids=ids, include=[]).get("ids") or [])
+    docs = [d for d in docs if d["fsqId"] not in known]
+
+    truncated = len(docs) > MAX_INDEX_BATCH
+    if truncated:
+        docs = docs[:MAX_INDEX_BATCH]
+
+    if not docs:
+        return {"requested": requested, "alreadyIndexed": len(known),
+                "written": 0, "skipped": 0, "truncated": False}
+
+    # embeddings._client is the SentenceTransformer the read path already
+    # loaded. Reused rather than constructed fresh so there is one set of
+    # weights in the process, and no chance of the two paths drifting onto
+    # different models.
+    model = embeddings._client
+    tokenizer = model.tokenizer
+    window = model.max_seq_length - 2
+
+    texts = [build_text(d) for d in docs]
+    chunked = [chunk(t, tokenizer, window) for t in texts]
+
+    flat = [c for cs, _ in chunked for c in cs]
+    if not flat:
+        return {"requested": requested, "alreadyIndexed": len(known),
+                "written": 0, "skipped": len(docs), "truncated": truncated}
+
+    vecs = np.asarray(
+        model.encode(flat, normalize_embeddings=True, show_progress_bar=False),
+        dtype=np.float32,
+    )
+
+    out_ids, embs, documents, metas, skipped, cursor_i = [], [], [], [], 0, 0
+    for doc, text, (cs, n_tokens) in zip(docs, texts, chunked):
+        if not cs:
+            skipped += 1
+            continue
+        block = vecs[cursor_i:cursor_i + len(cs)]
+        cursor_i += len(cs)
+
+        out_ids.append(doc["fsqId"])
+        embs.append(pool(block).tolist())
+        documents.append(text[:2000])
+        metas.append({
+            "business_id": doc["fsqId"],
+            "name": doc.get("name") or "",
+            "n_chunks": len(cs),
+            "n_tokens": n_tokens,
+            "has_tips": bool(doc.get("tips")),
+        })
+
+    if out_ids:
+        db._collection.upsert(ids=out_ids, embeddings=embs,
+                              documents=documents, metadatas=metas)
+
+    return {"requested": requested, "alreadyIndexed": len(known),
+            "written": len(out_ids), "skipped": skipped, "truncated": truncated}
