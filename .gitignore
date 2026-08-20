@@ -36,3 +36,14 @@ package-lock.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets. This file WAS tracked (empty, so nothing leaked) and there was no
+# rule covering it — the next person to put a Mongo URI in it would have
+# committed the credential without noticing. Config now comes from the process
+# environment; see the Dockerfile.
+.env
+.env.*
+!.env.example
+
+# Cloud Run deploy secrets, passed via --env-vars-file. Never commit.
+env.yaml

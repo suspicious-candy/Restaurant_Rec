@@ -1,0 +1,48 @@
+# Everything here is EXCLUDED from the Docker build context — the tarball the
+# daemon receives before a single instruction runs. Without this file that
+# tarball is about 7GB, and `docker build` spends minutes uploading data the
+# image then throws away.
+
+# 6.1GB, and a Windows virtualenv is useless in a Linux image regardless: the
+# Dockerfile installs Linux wheels from requirements.txt.
+.venv/
+venv/
+env/
+
+# chroma_db/ is deliberately NOT ignored.
+#
+# On Cloud Run the index has to ship inside the image, because the platform
+# gives a container no persistent disk — see the long note on CHROMA_DIR in the
+# Dockerfile. That makes the build context ~553MB rather than 96KB and the
+# push correspondingly slow, which is the price of scale-to-zero hosting.
+#
+# If you move to a host WITH a disk (Fly, a VM), uncomment the line below and
+# point CHROMA_DIR at the mount instead. The Dockerfile note explains what
+# changes.
+#
+# chroma_db/
+
+# 71MB of concatenated Yelp reviews, an input to the one-time seed scripts.
+tagged_reviews.txt
+data/
+*.parquet
+*.csv
+*.json
+
+# Secrets never belong in an image layer. Config comes from the environment.
+.env
+.env.*
+
+# Notebooks, git history and IDE state are not needed to serve requests.
+*.ipynb
+.ipynb_checkpoints/
+.git/
+.gitignore
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+
+# A stray package.json pulled these in; nothing Python uses them.
+node_modules/
+package-lock.json

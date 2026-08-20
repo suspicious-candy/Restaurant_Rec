@@ -31,7 +31,13 @@ from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-PERSIST_DIR = "chroma_db"
+
+# Where Chroma's SQLite lives. Env-driven for the same reason service.py's copy
+# is: a relative path resolves against the working directory, which is fine when
+# a human runs this from the repo and wrong in a container, where the index is a
+# mounted volume at an absolute path. The two MUST agree — point them at
+# different directories and the rebuild writes an index the service never reads.
+PERSIST_DIR = os.environ.get("CHROMA_DIR", "chroma_db")
 COLLECTION = "places_v2"
 
 # Cap on chunks per restaurant. Without it a place with 400 tips gets a
@@ -224,12 +230,19 @@ def main():
     if args.only_missing and args.recreate:
         raise SystemExit("--only-missing and --recreate are contradictory")
 
-    load_dotenv(os.path.join("..", "palate", ".env"))
+    # A development convenience only, and the real environment wins: dotenv does
+    # not override variables that are already set, so a container's -e flags beat
+    # anything in a file. The path is overridable and a missing file is not an
+    # error — see the same block in service.py.
+    load_dotenv(os.environ.get("RECOMMENDER_ENV_FILE", os.path.join("..", "palate", ".env")))
+
     # .strip(): the value in .env has a leading space after the '=' and not
     # every loader trims it.
     mongo_url = (os.environ.get("mongo_url") or "").strip()
     if not mongo_url:
-        raise SystemExit("mongo_url not found in ../palate/.env")
+        raise SystemExit(
+            "mongo_url is not set. Export it, or point RECOMMENDER_ENV_FILE at a file that does."
+        )
 
     # The URI carries no database name, so Node's driver silently falls back to
     # "test" — which is where the app's data actually lives. pymongo raises

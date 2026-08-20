@@ -1,0 +1,36 @@
+# Pinned to what the working .venv actually has, so a deploy reproduces the
+# environment the index was built and tested against rather than whatever
+# resolved that morning.
+#
+# INSTALL WITH THE CPU TORCH INDEX:
+#
+#     pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# The default PyPI wheel for torch is the CUDA build — it is what the dev .venv
+# has (2.6.0+cu124) and it is the single biggest thing in the image at roughly
+# 2.5GB unpacked, on top of the ~3GB of CUDA runtime it drags in. The whole venv
+# is 6.1GB. Nothing here uses a GPU: all-MiniLM-L6-v2 embeds a few hundred short
+# sentences per request on CPU comfortably. The +cpu wheel is a few hundred MB
+# and behaves identically. The Dockerfile passes this flag already.
+
+fastapi==0.139.0
+uvicorn==0.50.0
+
+# Must be imported before torch on Windows — see the note at the top of
+# service.py about duelling OpenMP runtimes. Harmless elsewhere.
+pyarrow==24.0.0
+
+torch==2.6.0
+sentence-transformers==5.6.0
+
+langchain-chroma==1.1.0
+langchain-huggingface==1.2.2
+chromadb==1.5.9
+
+pymongo==4.17.0
+python-dotenv==1.2.2
+numpy==2.5.1
+
+# rebuild_index.py only; harmless in the service image and keeps one file
+# describing the whole project.
+tqdm==4.68.3

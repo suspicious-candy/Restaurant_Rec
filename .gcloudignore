@@ -1,0 +1,45 @@
+# What `gcloud run deploy --source .` uploads to Cloud Build.
+#
+# THIS FILE EXISTS TO OVERRIDE .gitignore. When .gcloudignore is absent, gcloud
+# generates one from .gitignore — which excludes chroma_db/, because a 553MB
+# derived artifact has no business in git. The result is a deploy that succeeds,
+# a service that starts cleanly, and every single search returning nothing,
+# because the image shipped without an index. Silent and confusing.
+#
+# So chroma_db/ is deliberately NOT listed below. It has to reach the builder.
+# See the CHROMA_DIR note in the Dockerfile for why it lives in the image.
+
+# The Windows virtualenv: 6.1GB, and useless in a Linux image anyway — the
+# Dockerfile installs Linux wheels from requirements.txt.
+.venv/
+venv/
+env/
+
+# 71MB of concatenated Yelp reviews, input to the one-time seed scripts only.
+tagged_reviews.txt
+data/
+*.parquet
+*.csv
+
+# Notebooks and the stray Node install.
+*.ipynb
+.ipynb_checkpoints/
+node_modules/
+package-lock.json
+package.json
+
+# Secrets come from Cloud Run's environment, never from an uploaded file.
+# env.yaml is the local file passed to --env-vars-file: gcloud reads it on THIS
+# machine and sends the values over the API, so it must never be uploaded into
+# the build context or baked into a layer.
+.env
+.env.*
+!.env.example
+env.yaml
+
+# Local noise.
+.git/
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]

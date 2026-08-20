@@ -21,12 +21,18 @@ Retrieving top-K independently and intersecting afterwards does not work; two
 50-item draws from a 15,169-item corpus are expected to share 0.16 items, and
 the measured overlap was zero.
 
-Run from this directory (Chroma's persist_directory is a relative path):
+Development, from this directory (CHROMA_DIR defaults to ./chroma_db, and
+mongo_url is picked up from ../palate/.env):
     ./.venv/Scripts/python.exe -m uvicorn service:app --port 8000
+
+Production: every path and secret comes from the environment — see .env.example
+and the Dockerfile. Nothing here assumes a working directory or a sibling
+checkout any more. Set RECOMMENDER_TOKEN, or POST /index/missing is open.
 
 Restart it after any rebuild_index.py run — Chroma's PersistentClient caches
 in-process, so a collection dropped and rebuilt by another process is invisible
-to a service that is already running.
+to a service that is already running. This is also why the container runs a
+single worker; see the Dockerfile.
 """
 # Preload pyarrow BEFORE torch/transformers get pulled in below. On Windows
 # these packages each bundle their own native OpenMP runtime; if pyarrow's DLL
@@ -38,8 +44,11 @@ import pyarrow.dataset  # noqa: F401
 
 import os
 
+import secrets
+import sys
+
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -51,6 +60,42 @@ from langchain_chroma import Chroma
 # guards main() behind __name__, so importing it costs only its module-level
 # constants.
 from rebuild_index import build_text, chunk, pool
+
+"""Configuration, all of it, read once at import.
+
+Everything here used to be a literal or a relative path, which worked because
+the service was only ever started by hand from this directory with the Next app
+checked out as a sibling. None of those assumptions survive a deploy: there is
+no ../palate, the working directory is whatever the process manager chose, and
+the vector index is on a mounted volume rather than under the source tree.
+
+load_dotenv is now a DEVELOPMENT CONVENIENCE ONLY, and the order matters.
+os.environ wins, because python-dotenv does not override an existing variable by
+default — so a real environment (Docker, Fly, Render, systemd) is authoritative
+and the sibling .env is a fallback for a laptop. The path is also no longer
+hardcoded: RECOMMENDER_ENV_FILE overrides it, and a missing file is not an
+error, which is exactly what should happen in production.
+"""
+load_dotenv(os.environ.get("RECOMMENDER_ENV_FILE", os.path.join("..", "palate", ".env")))
+
+# Where Chroma's SQLite lives. Relative paths resolve against the working
+# directory, which is why this must be settable: a container mounts the index as
+# a volume at an absolute path, and 553MB is not going in the image.
+CHROMA_DIR = os.environ.get("CHROMA_DIR", "chroma_db")
+
+"""Shared secret for the write endpoint.
+
+/index/missing reads Mongo and runs a sentence-transformer over up to
+MAX_INDEX_BATCH rows inside the request. Unauthenticated on a public host that
+is both a way to run up CPU indefinitely and a way to keep a worker busy while
+real searches queue behind it.
+
+Unset means unauthenticated, which is right on a laptop and checked loudly at
+startup below. The read endpoints stay open: they are cheap, they leak nothing
+a user of the app cannot already see, and the Next app calls them on behalf of
+signed-out visitors.
+"""
+API_TOKEN = os.environ.get("RECOMMENDER_TOKEN", "").strip()
 
 app = FastAPI()
 
@@ -65,7 +110,7 @@ embeddings = HuggingFaceEmbeddings(
 # Mongo. The old "langchain" collection mixed 5,444 Yelp review-text docs with
 # 15,169 Foursquare template sentences in L2 space — two populations that were
 # never comparable. It is still on disk and can be deleted once nothing reads it.
-db = Chroma(collection_name="places_v2", persist_directory="chroma_db",
+db = Chroma(collection_name="places_v2", persist_directory=CHROMA_DIR,
             embedding_function=embeddings)
 
 # Probed rather than hardcoded to 384, so swapping the model cannot silently
@@ -85,6 +130,49 @@ STRATEGIES = ("blend", "min", "mean", "centroid")
 # holding a worker for minutes. A full build is still rebuild_index.py's job.
 MAX_INDEX_BATCH = 500
 
+if not API_TOKEN:
+    # stderr and flush=True, not a bare print. Python block-buffers stdout when
+    # it is not a TTY, which is every container, so a plain print can sit in the
+    # buffer indefinitely — and a security warning that appears an hour late, or
+    # not at all because the process was killed first, is not a warning. uvicorn
+    # logs to stderr too, so this lands in order with the rest of the boot.
+    print(
+        # Plain ASCII deliberately. Comments in this file use em-dashes freely,
+        # but this string is emitted to a log that may be read through a console
+        # or aggregator in any codepage, and a security warning should not be the
+        # place a mojibake character makes someone doubt what they are reading.
+        "[recommender] RECOMMENDER_TOKEN is not set - POST /index/missing is "
+        "UNAUTHENTICATED. Fine on a laptop; on a reachable host anyone can drive "
+        "the embedding model. Set it, and send it as x-recommender-token.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def require_token(x_recommender_token: str = Header(default="")) -> None:
+    """Guard the write endpoint with a shared secret.
+
+    A shared secret rather than anything richer because the only caller is the
+    Next server, machine to machine. There is no user identity to model here and
+    no third party to federate with, so a signature scheme would be ceremony
+    around the same one secret.
+
+    secrets.compare_digest, not ==. String equality in CPython short-circuits on
+    the first differing byte, which leaks the length of the matching prefix
+    through response timing and makes the token recoverable byte by byte over
+    enough requests. This is the same reasoning as the constant-time bcrypt
+    compare in the app's login route.
+
+    Raises:
+        HTTPException: 401 if the header is missing or wrong.
+    """
+    # Unset means the guard is disabled — see the startup warning above.
+    if not API_TOKEN:
+        return
+    if not secrets.compare_digest(x_recommender_token, API_TOKEN):
+        raise HTTPException(401, "Missing or invalid x-recommender-token")
+
+
 _mongo = None
 
 
@@ -103,14 +191,12 @@ def _restaurants():
     """
     global _mongo
     if _mongo is None:
-        # Same path rebuild_index.py uses; the service is run from this
-        # directory. .strip() because the value in .env has a leading space.
-        load_dotenv(os.path.join("..", "palate", ".env"))
         url = (os.environ.get("mongo_url") or "").strip()
         if not url:
             raise HTTPException(503, "mongo_url not configured; cannot index")
-        # The URI carries no database name and pymongo will not guess, so name
-        # it explicitly — "test" is where the app's data actually lives.
+        # The URI usually carries no database name and pymongo will not guess,
+        # so name it explicitly. "test" is the historical default because that
+        # is where the app's data actually landed; set MONGO_DB to override.
         _mongo = MongoClient(url)[os.environ.get("MONGO_DB", "test")]
     return _mongo.restaurants
 
@@ -494,11 +580,16 @@ class IndexMissingReq(BaseModel):
         businessIds: restrict the top-up to these fsqIds — what a caller that
             has just synced a handful of places should send. Omit to sweep
             every unindexed `source: "foursquare"` row, up to MAX_INDEX_BATCH.
+        force: re-embed the listed rows even if Chroma already holds them, for
+            when the TEXT changed rather than the row being new — a post-meal
+            review landing in tips[] is the case this exists for. Requires
+            businessIds; see index_missing for why.
     """
     businessIds: list[str] = []
+    force: bool = False
 
 
-@app.post("/index/missing")
+@app.post("/index/missing", dependencies=[Depends(require_token)])
 def index_missing(req: IndexMissingReq):
     """Embed restaurants that MongoDB has and the index does not.
 
@@ -530,7 +621,17 @@ def index_missing(req: IndexMissingReq):
 
     Raises:
         HTTPException: 503 if Mongo is not configured or unreachable.
+            400 if force is set without businessIds.
     """
+    # force + no ids would re-embed the whole corpus, MAX_INDEX_BATCH rows of
+    # encoding inside one request, holding a worker for minutes. A full re-embed
+    # is rebuild_index.py's job; this endpoint stays a top-up.
+    if req.force and not req.businessIds:
+        raise HTTPException(
+            status_code=400,
+            detail="force requires businessIds — a full re-embed is rebuild_index.py's job",
+        )
+
     col = _restaurants()
 
     query = {"source": "foursquare"}
@@ -553,7 +654,13 @@ def index_missing(req: IndexMissingReq):
     # Chroma for the ~20k it holds to check 50 would dominate the request.
     ids = [d["fsqId"] for d in docs]
     known = set(db._collection.get(ids=ids, include=[]).get("ids") or [])
-    docs = [d for d in docs if d["fsqId"] not in known]
+    # Under force the filter is skipped, not the get(): alreadyIndexed stays an
+    # honest count of what was overwritten. Safe because the write below is an
+    # upsert keyed on fsqId, so re-embedding replaces a vector rather than
+    # duplicating it — and the text still comes from Mongo through build_text,
+    # so the "one template" invariant in the module docstring holds either way.
+    if not req.force:
+        docs = [d for d in docs if d["fsqId"] not in known]
 
     truncated = len(docs) > MAX_INDEX_BATCH
     if truncated:
