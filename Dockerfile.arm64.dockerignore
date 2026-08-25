@@ -1,0 +1,53 @@
+# Build context for Dockerfile.arm64 ONLY.
+#
+# BuildKit looks for `<dockerfile>.dockerignore` before falling back to
+# `.dockerignore`, so `docker build -f Dockerfile.arm64` reads this file and the
+# Cloud Run build keeps reading the other one. That separation is the point:
+# the two hosts want opposite answers about chroma_db/, and editing the shared
+# .dockerignore to suit Oracle would silently ship Cloud Run an empty index --
+# the exact failure its own comment warns about. This way the rollback path
+# stays intact until you delete it deliberately.
+
+# THE DIFFERENCE FROM .dockerignore: chroma_db/ IS excluded here.
+#
+# It is 553MB, it belongs on the mounted volume, and keeping it out of the
+# context is most of why a code deploy on this host is seconds rather than
+# minutes. Dockerfile.arm64 sets CHROMA_DIR=/data/chroma_db to match.
+chroma_db/
+
+# --- everything below is identical to .dockerignore ---
+
+# 6.1GB, and a Windows virtualenv is useless in a Linux image regardless.
+.venv/
+venv/
+env/
+
+# 71MB of concatenated Yelp reviews, an input to the one-time seed scripts.
+tagged_reviews.txt
+data/
+*.parquet
+*.csv
+*.json
+
+# Secrets never belong in an image layer. Config comes from the environment.
+.env
+.env.*
+env.yaml
+
+# Notebooks, git history and IDE state are not needed to serve requests.
+*.ipynb
+.ipynb_checkpoints/
+.git/
+.gitignore
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+
+# A stray package.json pulled these in; nothing Python uses them.
+node_modules/
+package-lock.json
+
+# The deploy directory itself -- compose files and Caddyfile are read from the
+# host, not from inside the image.
+deploy/

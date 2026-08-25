@@ -1,0 +1,75 @@
+# syntax=docker/dockerfile:1
+
+# ARM64 build for Oracle Cloud Ampere A1. See deploy/oracle/README.md.
+#
+# The root Dockerfile still builds the Cloud Run image and is left alone on
+# purpose, so the running deployment keeps serving until this one is verified.
+# Delete it after cutover.
+#
+# Three differences, all of them consequences of the host having a real disk and
+# no image registry billing by the gigabyte:
+#
+#   1. No --extra-index-url. On aarch64 the default PyPI torch wheel is already
+#      CPU-only -- there is no CUDA build for ARM in that channel -- so the flag
+#      that saves ~2.5GB on x86 buys nothing here and risks resolving against an
+#      index that has no wheel for this platform.
+#
+#   2. A C++ toolchain is present. See the note on the apt layer.
+#
+#   3. chroma_db/ is NOT copied in. It arrives as a bind mount, which is the
+#      whole point of the move: the image drops by 553MB, a code deploy stops
+#      republishing the index, and writes through POST /index/missing finally
+#      survive a restart.
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# chroma-hnswlib publishes aarch64 wheels inconsistently across releases. When
+# one is missing pip falls back to compiling it, and without a toolchain that
+# fails deep in a C++ error that reads like a chromadb bug rather than a missing
+# compiler. This adds ~300MB to the image.
+#
+# On Cloud Run that was worth avoiding, because every megabyte sat in Artifact
+# Registry at $0.10/GB/month, forever, once per deploy. Here the image never
+# leaves the VM's local disk, so the tradeoff inverts: take the size, keep the
+# build deterministic.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dependencies as their own layer, so editing service.py does not reinstall
+# several hundred megabytes of PyTorch on every rebuild.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Bake the model, same reasoning as the Cloud Run image: left to runtime the
+# ~90MB download happens inside the first request and makes the service depend
+# on huggingface.co being reachable. It never changes, so it belongs in a layer.
+RUN python -c "\
+from sentence_transformers import SentenceTransformer; \
+SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
+# Source only. chroma_db/ is excluded by .dockerignore on this host -- uncomment
+# the line there, as its own note instructs -- and is bind-mounted at runtime.
+COPY . .
+
+# A MOUNT POINT, not a path inside the image.
+#
+# Read this before changing the volume in docker-compose.yml. service.py builds
+# Chroma at import time (line 113), and Chroma treats a missing or empty
+# persist_directory as "new empty collection" rather than an error. So if the
+# mount is wrong the container starts cleanly, answers health checks, serves
+# /docs, and returns zero results for every query. There is no crash to point
+# at. ALWAYS verify a real query after touching this.
+ENV CHROMA_DIR=/data/chroma_db
+
+# No ${PORT} indirection: nothing injects a port here the way Cloud Run did.
+# Caddy is the only thing that talks to this, over the compose network.
+EXPOSE 8080
+
+# One worker, unchanged from the Cloud Run image: each loads its own copy of the
+# model, and Chroma caches in-process so a write through one worker is invisible
+# to the others. The exec form is safe here because there is no ${PORT} to
+# expand, and it makes uvicorn PID 1 so SIGTERM lands on it directly.
+CMD ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

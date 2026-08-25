@@ -1,0 +1,17 @@
+# Copy to the Space repo root as `.dockerignore`.
+#
+# Small on purpose. The Space repo holds only the six things the service needs,
+# so there is little to exclude -- but .git is not one of them, and on an LFS
+# repo it contains a second full copy of the 553MB index. Without this line
+# `COPY . .` doubles the image for nothing.
+.git/
+.gitattributes
+
+# chroma_db/ is deliberately NOT excluded. Spaces have no persistent disk, so
+# the index must ship inside the image -- same constraint as Cloud Run. See the
+# note in the Dockerfile.
+
+__pycache__/
+*.py[cod]
+.env
+.env.*

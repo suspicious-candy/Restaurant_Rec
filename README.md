@@ -8,12 +8,19 @@ Originally exploratory work on the [Yelp Open Dataset](https://www.yelp.com/data
 that data now serves as a seed and a test fixture, and the live index is built
 from Palate's own MongoDB.
 
-> **Deployment status:** containerised and ready for Google Cloud Run. The
+> **Deployment status: live on Google Cloud Run**, serving
+> [Palate on Vercel](https://palate-suspicious-candy.vercel.app/). The
 > `Dockerfile`, `.dockerignore`, `.gcloudignore` and `env.yaml.example` in this
 > directory are the whole deploy. See [Deployment](#deployment) — and read
 > [The index ships inside the image](#the-index-ships-inside-the-image) before
-> the first deploy, because it changes what `POST /index/missing` means in
-> production.
+> touching it, because it changes what `POST /index/missing` means in production.
+>
+> Two things changed after the first deploy and both are documented below:
+> `GET /health` now exists, because a wrong index path produces a container that
+> starts perfectly and answers every query with nothing; and the `Dockerfile`
+> splits the index and the source into **separate layers**, because bundling
+> them meant every one-line code change republished 553MB into Artifact Registry
+> — see [What the first deploys cost](#what-the-first-deploys-cost).
 
 ---
 
@@ -24,6 +31,7 @@ from Palate's own MongoDB.
 - [Configuration](#configuration)
 - [API](#api)
 - [Deployment](#deployment)
+- [Other hosts evaluated](#other-hosts-evaluated)
 - [Files](#files)
 - [Rebuilding the index](#rebuilding-the-index)
 - [The index](#the-index)
@@ -42,13 +50,13 @@ Foursquare API ──► MongoDB `restaurants`  ◄── source of truth for te
                           │  rebuild_index.py   (the index's ONLY writer)
                           ▼
                    Chroma `places_v2`     ◄── derived index, disposable
-                          ▲  │
-        POST /index/missing │  │  service.py
+                          ▲  │                  (ships inside the image)
+        POST /index/missing │  │  service.py    ── on Google Cloud Run
      (same build_text path) │  ▼
-              POST /recommend  ·  POST /recommend/group
+      POST /recommend · POST /recommend/group · GET /health
                           ▲
-                          │  HTTP  (+ x-recommender-token on the write)
-                   Palate (Next.js)
+                          │  HTTPS  (+ x-recommender-token on the write)
+                   Palate (Next.js) ── on Vercel
 ```
 
 **Mongo is the source of truth; Chroma is a derived index.** That direction is
@@ -100,6 +108,18 @@ list, while the group shortlist route returns 503 and a vote cannot start at
 all. Two opposite symptoms from one missing process — see
 [the two timeouts](#cold-starts-and-the-two-timeouts).
 
+Confirm it came up against a real index before doing anything else — "it
+started" and "it can answer" are different claims here:
+
+```bash
+curl -s http://localhost:8000/health
+```
+
+`{"status":"ok","count":15211}`. A 503 with `"status":"empty"` means you started
+it from the wrong directory, so `CHROMA_DIR` resolved somewhere with no store in
+it — and Chroma creates an empty collection rather than complaining. See
+[`GET /health`](#get-health).
+
 ---
 
 ## Configuration
@@ -129,7 +149,55 @@ gcloudignored.
 
 ## API
 
-Two read endpoints, open. One write endpoint, guarded.
+Two search endpoints and a health check, open. One write endpoint, guarded.
+
+### `GET /health`
+
+```jsonc
+// no headers
+→ 200 { "status": "ok", "count": 15211 }
+→ 503 { "status": "empty", "count": 0 }
+→ 503 { "status": "error", "count": null, "error": "OperationalError" }
+```
+
+```jsonc
+// headers: { "x-recommender-token": "<RECOMMENDER_TOKEN>" }
+→ 200 {
+  "collection": "places_v2",
+  "chromaDir":  "/app/chroma_db",   // the RESOLVED path, not the env var
+  "embedDim":   384,
+  "writeGuard": "enforced",
+  "status":     "ok",
+  "count":      15211
+}
+```
+
+**The count is the whole point.** Chroma treats a missing or empty
+`persist_directory` as a *new empty collection* rather than an error, and `db` is
+built at import time — so a wrong `CHROMA_DIR` produces a process that starts
+cleanly, serves `/docs`, passes any "is it listening?" probe, and returns nothing
+for every single query. Until this endpoint there was no `GET` route through
+which to notice that.
+
+Which is why **an empty collection is a 503, not a 200.** Returning success with
+`count: 0` would put a green tick on a broken deploy. 503 surfaces in
+`docker ps` as `(unhealthy)` and to an uptime check, without causing a restart
+loop, since nothing acts on health status by default.
+
+It deliberately **does not touch Mongo.** The Mongo client is lazy precisely so
+an unreachable database cannot stop the read endpoints from serving searches
+they are perfectly capable of serving; failing health on it would undo that and
+take the service down for an outage it can ride out.
+
+The detail fields are token-gated because the resolved filesystem path and
+whether the write guard is active are not things a public endpoint should
+volunteer — but `status` and `count` stay open, because a container healthcheck
+and an external probe both need them and neither can hold a secret. Same
+`secrets.compare_digest` as the write guard, for the same reason.
+
+`chromaDir` being the *resolved* absolute path is what catches the most common
+version of this failure: a relative `CHROMA_DIR` landing against an unexpected
+working directory.
 
 ### `POST /recommend`
 
@@ -213,9 +281,9 @@ signed-out visitors.
 
 ## Deployment
 
-Target is **Google Cloud Run**, and the `Dockerfile` is written for its
-constraints specifically. The whole deploy is one command; everything
-interesting is in what the image contains and why.
+Runs on **Google Cloud Run** (`asia-south1`), and the `Dockerfile` is written for
+its constraints specifically. The whole deploy is one command; everything
+interesting is in what the image contains, in what order, and why.
 
 ### Prerequisites
 
@@ -314,8 +382,66 @@ degrade to distance order, so this is slow staleness rather than failure.
 ```
 
 On a host **with** a disk (Fly, a VM), none of this applies: delete the
-`COPY . .` index inclusion, re-add `chroma_db/` to `.dockerignore`, point
-`CHROMA_DIR` at the mount, and runtime writes persist.
+`COPY chroma_db/ ./chroma_db/` line, re-add `chroma_db/` to `.dockerignore`,
+point `CHROMA_DIR` at the mount, and runtime writes persist. That variant is
+written out in `Dockerfile.arm64` — see
+[Other hosts evaluated](#other-hosts-evaluated).
+
+### What the first deploys cost
+
+Worth reading before you deploy ten times in a week, because the bill does not
+come from where you would look for it.
+
+Roughly ten deploys over three days billed about **$1.04** — a ~$16/month run
+rate. Almost none of it was compute. Cloud Run's free tier (240,000 vCPU-s,
+450,000 GiB-s, 2M requests per month) covered the actual request handling
+comfortably. The spend was **storage of repeated deploy artifacts**: Artifact
+Registry gives 0.5GB free and then charges $0.10/GB/month, and nothing garbage-
+collects old image layers or the `--source .` build-context tarballs that land
+in a staging bucket on every deploy.
+
+The cause was one line. The image originally ended with:
+
+```dockerfile
+COPY . .
+```
+
+A Docker layer is rebuilt whenever its inputs change, and every rebuilt layer is
+pushed and stored as a **new blob**. That single `COPY` put the 553MB index and
+the ~40KB of source into *one* layer, so editing a line of `service.py`
+invalidated both and republished half a gigabyte. Ten deploys, ten near-identical
+copies of the index, billing forever.
+
+The fix is a two-line split, and **the order is the whole point**:
+
+```dockerfile
+COPY chroma_db/ ./chroma_db/          # stable: changes only when the index does
+COPY service.py rebuild_index.py ./   # churning: changes every code edit
+```
+
+Layers cache in order, so the stable thing has to come *first* or the split buys
+nothing. Now a routine code deploy pushes kilobytes and reuses the cached 553MB
+layer.
+
+Two consequences to keep in mind:
+
+- The second `COPY` **names files explicitly** rather than using `COPY . .`,
+  which would re-copy `chroma_db/` and undo the split. That list is the complete
+  runtime set: `service.py` imports `build_text`, `chunk` and `pool` from
+  `rebuild_index`, and nothing else in the tree is imported at runtime. **Adding
+  a new runtime module means adding it to that line** — and forgetting produces
+  an `ImportError` at container start, which Cloud Run reports as a generic
+  "failed to start and listen".
+- Rebuilding the index still republishes 553MB, by design. That is the one
+  deploy where the cost is real, and it is another reason the rebuild cadence is
+  monthly rather than continuous.
+
+**If you are diagnosing a bill, check the attribution before trusting any of
+this.** Billing → Cost breakdown, grouped by service. Spend under *Artifact
+Registry* or *Cloud Build* is this problem. Spend under *Cloud Run* itself is a
+different problem — traffic or a misconfiguration — and would follow you onto
+any other host. Keep a **$5 budget alert** on the project regardless; it costs
+nothing and it is the only thing watching when you have stopped.
 
 ### Shrink the image first
 
@@ -346,15 +472,36 @@ database size. The `langchain` vectors are **not** reproducible from Mongo alone
 that history matters. Two orphaned segment directories from earlier rebuilds
 (~25MB) are also on disk and are not referenced by the `segments` table.
 
+> **Still not done.** The shipped index carries both collections; the count in
+> `/health` is `places_v2`'s alone, so this is invisible from the outside. Doing
+> it now costs one 553MB layer republish — the shrink changes the index layer's
+> inputs, so that deploy pushes the whole thing — and every deploy after it
+> caches a smaller one. Worth doing on the next rebuild rather than as its own
+> deploy.
+
 ### Verify after deploying
 
+Start with the index, because an image that shipped without one is the single
+most likely thing to be wrong and the only failure that looks like success:
+
 ```bash
-curl -s -X POST "$SERVICE_URL/recommend" -H 'Content-Type: application/json' -d '{"query":"A Italian, Pizza restaurant","k":3}'
+curl -s "$SERVICE_URL/health"
 ```
 
-A non-empty `businessIds` proves the image shipped with a populated index — the
-single most likely thing to be wrong on a first deploy. Then check the write
-guard is actually on:
+`{"status":"ok","count":15211}`. **The number is the assertion** — a materially
+different count means the build context did not carry the index you expected,
+and the fix is to rebuild and redeploy rather than to debug the app. A 503 with
+`"status":"empty"` means `chroma_db/` never reached the image; check
+`.gcloudignore` still exists.
+
+Then the resolved paths and the guard state, which need the token:
+
+```bash
+curl -s -H "x-recommender-token: $RECOMMENDER_TOKEN" "$SERVICE_URL/health"
+```
+
+`"writeGuard": "enforced"` is the one to read. Confirm it from the other side
+too — an unauthenticated write must be refused:
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "$SERVICE_URL/index/missing" -H 'Content-Type: application/json' -d '{"businessIds":["x"]}'
@@ -362,8 +509,94 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST "$SERVICE_URL/index/missing" -H
 
 **401 is the correct answer.** A 200 means `RECOMMENDER_TOKEN` did not reach the
 service, and the startup log will contain the `RECOMMENDER_TOKEN is not set`
-warning to confirm it. Finally, set `RECOMMENDER_URL` in Vercel to
-`$SERVICE_URL` and `RECOMMENDER_TOKEN` to the same value — see the app's README.
+warning to confirm it.
+
+Health proves vectors exist; it does not prove ranking works. Finish with a real
+query:
+
+```bash
+curl -s -X POST "$SERVICE_URL/recommend" -H 'Content-Type: application/json' -d '{"query":"A Italian, Pizza restaurant","k":3}'
+```
+
+**A 200 with an empty array is a failure, not a pass.** Finally, set
+`RECOMMENDER_URL` in Vercel to `$SERVICE_URL` and `RECOMMENDER_TOKEN` to the same
+value — see the app's README — then exercise both callers, the dashboard's
+`/nearby` and a group shortlist.
+
+> `/health` is also the right target for an external uptime check. It is cheap,
+> needs no token, and returns 200 only once the index is genuinely readable — so
+> a monitor pointed at it catches a bad rebuild instead of letting the service
+> quietly serve zero results.
+
+---
+
+## Other hosts evaluated
+
+The `deploy/` directory holds two complete, unused migration paths. They exist
+because when the Artifact Registry bill appeared the obvious reading was *"Cloud
+Run is expensive, move"* — and both alternatives were built out far enough to be
+deployable before the actual cause turned out to be
+[one `COPY` line](#what-the-first-deploys-cost).
+
+**Cloud Run stayed, because the problem was never the host.** A ~$16/month run
+rate from republishing the same 553MB layer is an artifact-storage bug with a
+two-line fix; it is not a reason to take on OS administration or a 48-hour sleep
+timer. Fixing the cause was cheaper than either migration, in money and in
+attention.
+
+They are kept rather than deleted because they are genuinely useful — as a
+costed comparison, as a fallback if this service outgrows scale-to-zero, and
+because working through the bind-mount case is what produced
+[`GET /health`](#get-health), which turned out to be worth having here too.
+
+| | **Cloud Run** (live) | `deploy/oracle/` | `deploy/hf-space/` |
+|---|---|---|---|
+| Host | Google Cloud Run | Oracle Ampere A1, Always Free | HF Spaces, free CPU Basic |
+| Arch | x86 | **ARM64** (`Dockerfile.arm64`) | x86 |
+| Idle | Scales to zero, cold start | Always on | **Sleeps after 48h**, 30–90s wake |
+| `chroma_db/` | In the image | **Bind-mounted** from disk | In the image, via Git LFS |
+| `/index/missing` writes | Vanish on scale-down | **Persist** | Vanish on restart |
+| TLS | Provided | Caddy + Let's Encrypt (sslip.io) | Provided |
+| Port | `$PORT`, injected | 8080 behind Caddy | **7860, hardcoded** |
+| Runs as | root | root | **UID 1000** |
+| Cost | ~$0 once layers are split | $0 | $0 |
+| You administer | Nothing | OS, firewall, certs, restarts | Nothing |
+
+Each has a full walkthrough in its own directory — `deploy/oracle/README.md` and
+`deploy/hf-space/SETUP.md` — including the parts that bite:
+
+- **Oracle:** Always Free A1 capacity is heavily contested and *"Out of host
+  capacity"* is the normal first response (`retry-launch.sh` exists for that).
+  Oracle also **reclaims** Always Free compute that sits under ~20% utilisation
+  across a 7-day window, which a service answering occasional queries can trip.
+  And Oracle's Ubuntu images ship iptables rules that REJECT inbound traffic
+  regardless of what the cloud Security List allows — the symptom is a
+  connection that hangs rather than refuses.
+- **HF Spaces:** the 48-hour sleep is survivable only with a scheduled ping
+  against `/health` (UptimeRobot or cron-job.org — *not* GitHub Actions cron,
+  which is auto-disabled after 60 days of repository inactivity, precisely when
+  you have stopped watching). The 553MB index has to travel through Git LFS
+  against a free-account storage quota, which may rule the host out before
+  anything else does.
+- **Both:** neither has a static egress IP, so both require opening MongoDB
+  Atlas to `0.0.0.0/0`. Cloud Run's egress is not stable either — but it *can*
+  be pinned, with a VPC connector and Cloud NAT behind one allowlisted address,
+  and that option is what these two give up permanently. If you take either
+  path, do two things first: rotate the Atlas password, and switch to a
+  **read-only** database user.
+
+  The read-only part is verified rather than assumed. `service.py` touches Mongo
+  in exactly one place — a single `col.find(...)` — and nowhere inserts, updates
+  or deletes; `POST /index/missing` writes to *Chroma*, not to Mongo. So `read`
+  on the one database is sufficient, and a leaked connection string then cannot
+  modify or destroy anything. Worth re-checking with a grep if the service ever
+  grows a write path, because nothing enforces this but the code itself.
+
+Nothing on the Cloud Run path was deleted to make room for these. The root
+`Dockerfile`, `.dockerignore` and `.gcloudignore` are the live deploy;
+`Dockerfile.arm64` carries its own
+`Dockerfile.arm64.dockerignore` via BuildKit's per-Dockerfile context, so the two
+do not interfere.
 
 ---
 
@@ -371,12 +604,15 @@ warning to confirm it. Finally, set `RECOMMENDER_URL` in Vercel to
 
 | file | purpose |
 |---|---|
-| `service.py` | FastAPI API. Reads for `/recommend*`; tops up vectors via `/index/missing`. |
+| `service.py` | FastAPI API. Reads for `/recommend*`, liveness for `/health`; tops up vectors via `/index/missing`. |
 | `rebuild_index.py` | Builds `places_v2` from Mongo. Owns `build_text` — the one template. |
-| `Dockerfile` | The deploy. Every non-obvious line has the reasoning inline. |
+| `Dockerfile` | **The live deploy** (Cloud Run, x86, index baked in). Every non-obvious line has the reasoning inline — including why the index and the source are separate `COPY` layers. |
 | `requirements.txt` | Pinned to what the working `.venv` has, so a deploy reproduces the environment the index was tested against. |
 | `.dockerignore` / `.gcloudignore` | What reaches the builder. `.gcloudignore` exists to override `.gitignore` — see above. |
 | `env.yaml.example` | Template for the Cloud Run `--env-vars-file`. |
+| `Dockerfile.arm64` | Unused. ARM build with the index **bind-mounted** instead of baked, for a host with a disk. Pairs with `Dockerfile.arm64.dockerignore` (BuildKit per-Dockerfile context, so the Cloud Run one is untouched). |
+| `deploy/oracle/` | Unused. Oracle Ampere A1 walkthrough: `docker-compose.yml`, `Caddyfile`, `retry-launch.sh` for capacity retries. See [Other hosts evaluated](#other-hosts-evaluated). |
+| `deploy/hf-space/` | Unused. Hugging Face Spaces walkthrough: its own `Dockerfile` (port 7860, UID 1000), `SETUP.md`, and the Space's `README.md` frontmatter. |
 | `backfill_source.py` | One-time: stamps every restaurant with its provenance. |
 | `experiment_template.py` | Offline comparison of embedding text templates. |
 | `export_seed.py` | One-time: Yelp parquet → `palate/scripts/data/restaurants.seed.json`. |
@@ -424,8 +660,10 @@ does not drift, for the reason in
 [The index ships inside the image](#the-index-ships-inside-the-image).
 
 A dead `langchain` collection is still on disk with 20,613 vectors in L2 space,
-mixing Yelp review text with Foursquare template sentences. Delete it before
-building the deploy image — see [Shrink the image first](#shrink-the-image-first).
+mixing Yelp review text with Foursquare template sentences — **and it shipped**,
+since the deployed image is a copy of this directory. Nothing reads it; it is
+pure cold-start weight. Drop it on the next rebuild — see
+[Shrink the image first](#shrink-the-image-first).
 
 ---
 
@@ -562,10 +800,17 @@ choose which rows to index, never what to embed.**
 - **No evaluation harness.** Every number above came from a throwaway script.
   Promoting them into a repeatable suite with a fixed probe set is what would
   make "did that change help?" answerable.
-- **No `/health` endpoint.** Cloud Run's readiness check is "does it listen on
-  `$PORT`", which passes before the model has loaded and before anyone has
-  confirmed the index is non-empty. The `curl /recommend` in
-  [Verify after deploying](#verify-after-deploying) is the manual stand-in.
+- **`/health` catches an empty index, not a stale one.** It reports whether
+  `places_v2` is readable and non-empty, which closes the failure it was written
+  for. It cannot tell you the index is three cities and two months behind Mongo —
+  the count would be perfectly healthy and the answers quietly wrong. Comparing
+  `count` against `db.restaurants.countDocuments({source: "foursquare"})` would
+  make that visible; nothing does it today.
+
+  (The narrower readiness gap *is* closed, and by accident: `EMBED_DIM` is
+  computed at module scope with a live `embed_query` call, so the model is fully
+  loaded before the process can accept a connection at all. A container that
+  answers anything has already paid for the model.)
 
 ---
 

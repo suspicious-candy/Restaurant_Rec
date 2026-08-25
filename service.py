@@ -48,7 +48,7 @@ import secrets
 import sys
 
 import numpy as np
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -417,6 +417,77 @@ class GroupRecReq(BaseModel):
     strategy: str = "blend"
     alpha: float = 0.5
     debug: bool = False
+
+
+@app.get("/health")
+def health(response: Response, x_recommender_token: str = Header(default="")):
+    """Report whether this process can actually answer a search.
+
+    Added for the move to a host where the index arrives as a bind mount rather
+    than inside the image. Chroma treats a missing or empty persist_directory as
+    a NEW EMPTY COLLECTION rather than an error, and `db` is built at import
+    time, so a wrong mount produces a process that starts cleanly, serves /docs,
+    passes any liveness probe, and returns nothing for every query. Until this
+    endpoint there was no GET route to notice that through.
+
+    The count is the whole point. Returning 200 with `count: 0` would put a
+    green tick on a broken deploy, so an empty collection is a 503 — which
+    surfaces in `docker ps` as (unhealthy) and to an uptime check, without
+    causing a restart loop, since Docker does not act on health status by
+    default.
+
+    Deliberately does NOT touch Mongo. _restaurants() is lazy precisely so an
+    unreachable database cannot stop the read endpoints from serving searches
+    they are perfectly capable of serving; failing health on it would undo that
+    and take the service down for an outage it can ride out.
+
+    The detail fields are token-gated. `status` and `count` stay public because
+    the container healthcheck and any external probe need them, but the resolved
+    filesystem path and whether the write guard is active are not things a public
+    endpoint should volunteer. Same constant-time compare as require_token, for
+    the same reason.
+
+    Returns (JSON):
+        status: "ok" | "empty" | "error".
+        count: vectors in places_v2, or null if the collection could not be
+            read. The number that matters.
+        collection, chromaDir, embedDim: token-only. What THIS process actually
+            resolved, for comparing against the mount when count is wrong.
+        writeGuard: token-only. Whether RECOMMENDER_TOKEN is enforced, so a
+            deploy that lost the secret is visible here rather than by
+            discovering /index/missing is open.
+    """
+    body: dict = {}
+
+    # Unset token means the guard is disabled everywhere else too, so there is
+    # no secret to check against and nothing to gate on — see require_token.
+    if API_TOKEN and secrets.compare_digest(x_recommender_token, API_TOKEN):
+        body = {
+            "collection": "places_v2",
+            # The RESOLVED path, not the env var. A relative CHROMA_DIR against
+            # an unexpected working directory is a normal way to end up with an
+            # empty index, and only the absolute form shows that.
+            "chromaDir": os.path.abspath(CHROMA_DIR),
+            "embedDim": EMBED_DIM,
+            "writeGuard": "enforced" if API_TOKEN else "DISABLED",
+        }
+
+    try:
+        # db._collection, matching how /index/missing already reaches past the
+        # LangChain wrapper. Chroma exposes no count through it.
+        count = db._collection.count()
+    except Exception as exc:
+        # Unreadable SQLite, a permissions problem on the mount, a corrupt
+        # segment. Report the exception CLASS rather than str(exc): this is a
+        # public endpoint and the message routinely contains absolute paths.
+        response.status_code = 503
+        return {**body, "status": "error", "count": None, "error": type(exc).__name__}
+
+    if count == 0:
+        response.status_code = 503
+        return {**body, "status": "empty", "count": 0}
+
+    return {**body, "status": "ok", "count": count}
 
 
 @app.post("/recommend/group")

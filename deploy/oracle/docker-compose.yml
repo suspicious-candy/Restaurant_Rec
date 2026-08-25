@@ -1,0 +1,75 @@
+# Oracle Cloud Ampere A1 deployment. See README.md in this directory.
+#
+# Run from THIS directory: `docker compose up -d --build`.
+# The build context is the repo root two levels up, so .dockerignore applies.
+
+services:
+  recommender:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.arm64
+    image: palate-recommender:arm64
+    restart: unless-stopped
+
+    # mongo_url, MONGO_DB, RECOMMENDER_TOKEN. Copy .env.example to .env and
+    # fill it in. Never commit .env.
+    env_file: .env
+
+    volumes:
+      # THE INDEX. Left side is the host path you rsync'd chroma_db into; right
+      # side must match CHROMA_DIR in Dockerfile.arm64.
+      #
+      # :ro is deliberate but debatable. Read-only guarantees the 553MB index
+      # cannot be corrupted by a half-finished write, at the cost of making
+      # POST /index/missing fail loudly instead of persisting. Drop :ro once you
+      # actually want runtime indexing to stick -- that is the main thing this
+      # host makes possible. Keep it while you are still verifying the move.
+      - /opt/palate/chroma_db:/data/chroma_db:ro
+
+    # Loopback only. Caddy reaches this over the compose network as
+    # `recommender:8080`, so nothing needs to be exposed publicly -- but binding
+    # 127.0.0.1 means `curl localhost:8080/docs` works when you are SSH'd in,
+    # which is how you smoke-test without going through TLS.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    healthcheck:
+      # GET /health returns 503 when places_v2 is empty or unreadable, and
+      # urlopen raises HTTPError on 503, so a bad mount shows up in `docker ps`
+      # as (unhealthy) instead of as a green container serving zero results.
+      # That is the failure this whole deployment is shaped around -- see the
+      # CHROMA_DIR note in Dockerfile.arm64.
+      #
+      # No token sent: `status` and `count` are public, and only the diagnostic
+      # fields need it. The check needs the status code, nothing more.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Cold start loads torch and the model. Two ARM cores make that slow, and
+      # a short start_period marks the container unhealthy while it is merely
+      # booting, which restarts it into a loop that never converges.
+      start_period: 180s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      # e.g. 140-238-1-2.sslip.io -- see README.md step 7 on getting a
+      # Let's Encrypt certificate without owning a domain.
+      - SITE_ADDRESS=${SITE_ADDRESS}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates live here. Without a named volume Caddy re-requests one on
+      # every `up`, and Let's Encrypt rate-limits you out after five in a week.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - recommender
+
+volumes:
+  caddy_data:
+  caddy_config:

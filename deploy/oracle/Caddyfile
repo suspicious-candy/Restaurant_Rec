@@ -1,0 +1,32 @@
+# TLS terminates here. Vercel calls this over HTTPS carrying RECOMMENDER_TOKEN
+# in a header, so plain HTTP is not an option -- the token would cross the
+# public internet in clear text.
+#
+# Caddy provisions and renews a Let's Encrypt certificate for SITE_ADDRESS
+# automatically, provided port 80 is reachable from the internet for the
+# HTTP-01 challenge. Both Oracle firewall layers must allow it. See README.md
+# step 5 -- the VM's own iptables is the one everybody forgets.
+
+{$SITE_ADDRESS} {
+	reverse_proxy recommender:8080 {
+		transport http {
+			# The group-shortlist path is documented as taking up to 60s on a
+			# cold instance. Caddy's default response_header_timeout would cut
+			# that off and hand Vercel a 502 that looks like the recommender
+			# crashed. 300s matches the --timeout 300 the Cloud Run deploy used.
+			response_header_timeout 300s
+			read_timeout 300s
+			write_timeout 300s
+		}
+	}
+
+	encode gzip
+
+	# Ranked shortlists are JSON and compress well, but more importantly this
+	# log is where a 502 tells you whether Caddy could not reach the container
+	# or the container itself errored.
+	log {
+		output stdout
+		format console
+	}
+}

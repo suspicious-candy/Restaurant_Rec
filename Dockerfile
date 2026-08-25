@@ -29,9 +29,28 @@ RUN python -c "\
 from sentence_transformers import SentenceTransformer; \
 SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
-# Source AND the vector index. See the note below on why the index ships inside
-# the image on Cloud Run; .dockerignore is what decides whether it is included.
-COPY . .
+# TWO COPIES, NOT `COPY . .`, AND THE ORDER IS THE WHOLE POINT.
+#
+# A Docker layer is rebuilt whenever its inputs change, and every rebuilt layer
+# is pushed and stored as a NEW blob that nothing garbage-collects. `COPY . .`
+# put the 553MB index and the ~40KB of source into ONE layer, so editing a line
+# of service.py invalidated both and republished half a gigabyte. Ten deploys
+# meant ten near-identical copies of the index in Artifact Registry, billing at
+# $0.10/GB/month, forever.
+#
+# Splitting them means the index layer's inputs only change when the index
+# itself does -- i.e. when rebuild_index.py runs -- so routine code deploys push
+# kilobytes and reuse the cached 553MB layer.
+#
+# chroma_db FIRST because layers cache in order: the stable thing has to come
+# before the churning thing, or the split buys nothing.
+COPY chroma_db/ ./chroma_db/
+
+# Named explicitly rather than `COPY . .`, which would re-copy chroma_db and
+# undo the split. This is the complete set: service.py imports build_text, chunk
+# and pool from rebuild_index, and nothing else in the tree is imported at
+# runtime. Adding a new runtime module means adding it here.
+COPY service.py rebuild_index.py ./
 
 # THE INDEX LIVES IN THE IMAGE, and this is a Cloud Run decision rather than a
 # preference.
